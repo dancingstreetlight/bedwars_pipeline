@@ -1,9 +1,21 @@
 # Hypixel Bedwars Stats Tracker
 
+**TL;DR:** A Python and Flask app that saves snapshots of Hypixel Bedwars player stats and shows them in a browser dashboard, so you can track how you and your friends improve over time. You need a [Hypixel API key](#get-a-hypixel-api-key).
+
+```
+git clone https://github.com/dancingstreetlight/bedwars_pipeline.git
+cd bedwars_pipeline
+python -m pip install -r requirements.txt
+python server.py
+```
+
+Then open http://127.0.0.1:8000, paste your API key, enter a username, and press **Fetch latest stats**.
+
 Track Hypixel Bedwars stats for you and your friends, and see how they change over time.
 
 Every time you fetch, the app saves a snapshot of each player's stats. Because Hypixel only exposes current numbers, those snapshots are the only way to build a history. The dashboard turns them into a leaderboard, progress charts, and a data quality report.
 
+Individual player data is stored in bedwars_pipeline\data\raw
 
 ## Features
 
