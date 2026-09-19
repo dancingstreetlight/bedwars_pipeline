@@ -15,7 +15,7 @@ Track Hypixel Bedwars stats for you and your friends, and see how they change ov
 
 Every time you fetch, the app saves a snapshot of each player's stats. Because Hypixel only exposes current numbers, those snapshots are the only way to build a history. The dashboard turns them into a leaderboard, progress charts, and a data quality report.
 
-Individual player data is stored in bedwars_pipeline\data\raw
+Individual player data is stored in `bedwars_pipeline\data\raw`
 
 ## Features
 
