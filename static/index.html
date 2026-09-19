@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bedwars Stats</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <h1>Bedwars Stats</h1>
+    <p class="muted">Hypixel player stats, snapshot by snapshot.</p>
+  </header>
+
+  <section class="card controls" aria-labelledby="controls-title">
+    <h2 id="controls-title">Fetch stats</h2>
+    <div class="controls-grid">
+      <label class="field">
+        <span>Hypixel API key</span>
+        <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Hypixel API key">
+      </label>
+      <label class="field">
+        <span>Minecraft usernames (up to 10, separated by spaces, commas, or new lines)</span>
+        <textarea id="usernames" rows="3" spellcheck="false" placeholder="YourName Friend1 Friend2"></textarea>
+      </label>
+      <div class="actions">
+        <button id="fetch-btn" class="primary" type="button">Fetch latest stats</button>
+      </div>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </section>
+
+  <p id="empty-state" class="card notice" hidden>No data yet. Enter a username above and press Fetch.</p>
+
+  <div id="dashboard" hidden>
+    <div class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button role="tab" class="tab" data-tab="leaderboard" aria-selected="true" type="button">Leaderboard</button>
+      <button role="tab" class="tab" data-tab="history" aria-selected="false" type="button">History</button>
+      <button role="tab" class="tab" data-tab="quality" aria-selected="false" type="button">Data quality</button>
+    </div>
+
+    <section id="panel-leaderboard" class="panel card">
+      <h2>Lifetime stats (latest snapshot)</h2>
+      <div class="table-wrap"><table id="summary-table"></table></div>
+
+      <div class="row">
+        <label class="field inline">
+          <span>Compare players by</span>
+          <select id="bar-metric"></select>
+        </label>
+      </div>
+      <div class="chart-box">
+        <canvas id="bar-chart" aria-label="Bar chart comparing players" role="img"></canvas>
+        <p class="chart-fallback">Chart library did not load. Check your internet connection and refresh.</p>
+      </div>
+    </section>
+
+    <section id="panel-history" class="panel card" hidden>
+      <h2>Stats over time</h2>
+      <p id="history-hint" class="notice" hidden>Only one snapshot per player so far. Fetch again after playing a few games to see change over time.</p>
+      <div class="row">
+        <label class="field inline">
+          <span>Metric</span>
+          <select id="history-metric">
+            <option value="fkdr">FKDR</option>
+            <option value="wlr">WLR</option>
+            <option value="bedwars_level">Level</option>
+            <option value="games_played_bedwars">Games played</option>
+          </select>
+        </label>
+      </div>
+      <div class="chart-box">
+        <canvas id="line-chart" aria-label="Line chart of stats over time" role="img"></canvas>
+        <p class="chart-fallback">Chart library did not load. Check your internet connection and refresh.</p>
+      </div>
+      <h3>Change between snapshots</h3>
+      <div class="table-wrap"><table id="progress-table"></table></div>
+    </section>
+
+    <section id="panel-quality" class="panel card" hidden>
+      <h2>Validation results</h2>
+      <div class="stat-cards">
+        <div class="stat"><span class="stat-label">Snapshots passed</span><span id="stat-passed" class="stat-value">0</span></div>
+        <div class="stat"><span class="stat-label">Snapshots quarantined</span><span id="stat-quarantined" class="stat-value">0</span></div>
+        <div class="stat"><span class="stat-label">Players tracked</span><span id="stat-players" class="stat-value">0</span></div>
+      </div>
+      <p class="muted">Rows are quarantined if the UUID is missing, any counter is negative or unreadable, or wins exceed games played.</p>
+      <div class="table-wrap"><table id="quality-table"></table></div>
+    </section>
+  </div>
+
+  <footer class="site-footer muted">Data from the Hypixel public API. Not affiliated with Hypixel.</footer>
+</body>
+</html>
