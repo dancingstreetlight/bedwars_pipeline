@@ -1,6 +1,8 @@
 # Hypixel Bedwars Stats Tracker
 
-**TL;DR:** A Python and Flask app that saves snapshots of Hypixel Bedwars player stats and shows them in a browser dashboard, so you can track how you and your friends improve over time. You need a [Hypixel API key](#get-a-hypixel-api-key).
+**TL;DR:** 
+
+A Python and Flask app that saves snapshots of Hypixel Bedwars player stats and shows them in a browser dashboard, so you can track how you and your friends improve over time. You need a [Hypixel API key](#get-a-hypixel-api-key).
 
 [Demo](https://bedwars-pipeline.vercel.app/)
 
