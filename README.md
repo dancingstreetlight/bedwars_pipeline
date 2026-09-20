@@ -2,9 +2,11 @@
 
 **TL;DR:**
 
-A Python and Flask app that pulls Hypixel Bedwars stats and shows them in a browser dashboard. Look up players instantly, or tick **Save snapshot** to keep a history and track how you and your friends improve over time. You need a [Hypixel API key](#get-a-hypixel-api-key).
+A Python and Flask app that pulls Hypixel Bedwars stats and shows them in a browser dashboard. Look up players instantly, or tick **Save snapshot** to keep a history and track how you and your friends improve over time. 
 
-[Demo](https://bedwars-pipeline.vercel.app/)
+You need a [Hypixel API key](#get-a-hypixel-api-key).
+
+Click [here](https://bedwars-pipeline.vercel.app/) for a demo
 
 Open your terminal then paste these commands
 
