@@ -6,6 +6,8 @@ A Python and Flask app that saves snapshots of Hypixel Bedwars player stats and 
 
 [Demo](https://bedwars-pipeline.vercel.app/)
 
+Open your terminal then paste these commands
+
 ```
 git clone https://github.com/dancingstreetlight/bedwars_pipeline.git
 cd bedwars_pipeline
