@@ -1,0 +1,855 @@
+diff --git a/pipeline.py b/pipeline.py
+index 634c162..689159e 100644
+--- a/pipeline.py
++++ b/pipeline.py
+@@ -40,6 +40,23 @@ COUNTERS = [
+     "beds_lost_bedwars",
+ ]
+ 
++# Hypixel prefixes per-mode stats, e.g. "eight_two_final_kills_bedwars" is doubles.
++# Overall keeps the plain column names; other modes are stored as "<mode>_<counter>".
++MODE_PREFIXES = {
++    "solo": "eight_one_",
++    "doubles": "eight_two_",
++    "trios": "four_three_",
++    "fours": "four_four_",
++}
++MODES = ["overall"] + list(MODE_PREFIXES)
++
++
++def mode_col(mode, counter):
++    return counter if mode == "overall" else f"{mode}_{counter}"
++
++
++ALL_COUNTER_COLS = [mode_col(m, c) for m in MODES for c in COUNTERS]
++
+ 
+ # ---------------------------------------------------------------- Raw layer
+ 
+@@ -62,6 +79,13 @@ def fetch_player(uuid, api_key):
+         headers={"API-Key": api_key},
+         timeout=15,
+     )
++    if resp.status_code == 403:
++        raise RuntimeError(
++            "Hypixel rejected the API key (403). It is missing, invalid or expired. "
++            "Generate a fresh key at https://developer.hypixel.net and try again."
++        )
++    if resp.status_code == 429:
++        raise RuntimeError("Hypixel rate limit hit (429). Wait a minute and try again.")
+     resp.raise_for_status()
+     data = resp.json()
+     if not data.get("success"):
+@@ -69,6 +93,14 @@ def fetch_player(uuid, api_key):
+     return data
+ 
+ 
++def fetch_snapshot(name, api_key):
++    """Fetch one player from the APIs. Returns (uuid, raw_record). Writes nothing to disk."""
++    uuid = get_uuid(name)
++    payload = fetch_player(uuid, api_key)
++    ts = datetime.now(timezone.utc).strftime(TS_FORMAT)
++    return uuid, {"ingested_at": ts, "requested_name": name, "payload": payload}
++
++
+ def ingest(names, api_key):
+     """Save one untouched JSON snapshot per player. The raw layer is append only.
+ 
+@@ -77,19 +109,16 @@ def ingest(names, api_key):
+     results = {"saved": [], "skipped": []}
+     for name in names:
+         try:
+-            uuid = get_uuid(name)
+-            payload = fetch_player(uuid, api_key)
++            uuid, record = fetch_snapshot(name, api_key)
+         except (requests.RequestException, ValueError, RuntimeError) as exc:
+             print(f"skipped {name}: {exc}")
+             results["skipped"].append((name, str(exc)))
+             continue
+ 
+-        ts = datetime.now(timezone.utc).strftime(TS_FORMAT)
+         folder = RAW / uuid
+         folder.mkdir(parents=True, exist_ok=True)
+-        record = {"ingested_at": ts, "requested_name": name, "payload": payload}
+-        (folder / f"{ts}.json").write_text(json.dumps(record))
+-        print(f"saved {name} at {ts}")
++        (folder / f"{record['ingested_at']}.json").write_text(json.dumps(record))
++        print(f"saved {name} at {record['ingested_at']}")
+         results["saved"].append(name)
+         time.sleep(1)  # stay well under the API rate limit
+     return results
+@@ -111,32 +140,37 @@ def flatten(record):
+         "snapshot_ts": record["ingested_at"],
+         "bedwars_level": (player.get("achievements") or {}).get("bedwars_level"),
+     }
+-    for field in COUNTERS:
+-        row[field] = bedwars.get(field, 0)
++    for mode in MODES:
++        prefix = MODE_PREFIXES.get(mode, "")
++        for field in COUNTERS:
++            row[mode_col(mode, field)] = bedwars.get(f"{prefix}{field}", 0)
+     return row
+ 
+ 
+ def validate(df):
+     """Split rows into (good, bad). Bad rows go to a quarantine table."""
+-    ok = (
+-        df["uuid"].notna()
+-        & (df[COUNTERS] >= 0).all(axis=1)  # NaN fails this check too
+-        & (df["wins_bedwars"] <= df["games_played_bedwars"])
+-    )
++    ok = df["uuid"].notna() & (df[ALL_COUNTER_COLS] >= 0).all(axis=1)  # NaN fails this check too
++    for mode in MODES:
++        ok &= df[mode_col(mode, "wins_bedwars")] <= df[mode_col(mode, "games_played_bedwars")]
+     return df[ok].copy(), df[~ok].copy()
+ 
+ 
+-def build_clean():
+-    rows = [flatten(r) for r in load_raw()]
+-    if not rows:
+-        raise SystemExit("No raw data found. Run the ingest step first.")
+-
+-    df = pd.DataFrame(rows)
+-    df[COUNTERS] = df[COUNTERS].apply(pd.to_numeric, errors="coerce")
++def clean_records(records):
++    """Pure transform: raw records in, (good, bad) DataFrames out. Touches no files."""
++    df = pd.DataFrame([flatten(r) for r in records])
++    df[ALL_COUNTER_COLS] = df[ALL_COUNTER_COLS].apply(pd.to_numeric, errors="coerce")
+     df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"], format=TS_FORMAT, utc=True)
+     df = df.drop_duplicates(["uuid", "snapshot_ts"])
++    return validate(df)
+ 
+-    good, bad = validate(df)
++
++def build_clean():
++    """Read the raw folder, validate, and write the clean and quarantine tables."""
++    records = load_raw()
++    if not records:
++        raise SystemExit("No raw data found. Run the ingest step first.")
++
++    good, bad = clean_records(records)
+     CLEAN.mkdir(parents=True, exist_ok=True)
+     good.to_parquet(CLEAN / "bedwars_snapshots.parquet", index=False)
+     quarantine_path = CLEAN / "quarantine.parquet"
+@@ -155,17 +189,32 @@ def ratio(num, den):
+     return (num / den.where(den != 0, 1)).round(2)
+ 
+ 
+-def build_metrics(clean):
+-    df = clean.sort_values(["uuid", "snapshot_ts"]).reset_index(drop=True)
++def mode_view(clean, mode):
++    """One game mode's columns renamed to the plain counter names, so the maths is shared."""
++    keep = ["uuid", "username", "snapshot_ts", "bedwars_level"]
++    view = clean[keep + [mode_col(mode, c) for c in COUNTERS]].copy()
++    return view.rename(columns={mode_col(mode, c): c for c in COUNTERS})
++
++
++def add_ratios(df):
++    df["wlr"] = ratio(df["wins_bedwars"], df["losses_bedwars"])
++    df["fkdr"] = ratio(df["final_kills_bedwars"], df["final_deaths_bedwars"])
++    df["kdr"] = ratio(df["kills_bedwars"], df["deaths_bedwars"])
++    df["bblr"] = ratio(df["beds_broken_bedwars"], df["beds_lost_bedwars"])
++    df["win_rate"] = (df["wins_bedwars"] / df["games_played_bedwars"].where(
++        df["games_played_bedwars"] != 0, 1)).round(3)
++    return df
++
++
++def build_metrics(clean, write=True, mode="overall"):
++    """Lifetime summary and snapshot-to-snapshot progress for one game mode.
++
++    Only the overall mode is written to data/metrics. Other modes are computed on demand.
++    """
++    df = mode_view(clean, mode).sort_values(["uuid", "snapshot_ts"]).reset_index(drop=True)
+ 
+     # Lifetime summary from each player's latest snapshot
+-    latest = df.groupby("uuid").tail(1).copy()
+-    latest["wlr"] = ratio(latest["wins_bedwars"], latest["losses_bedwars"])
+-    latest["fkdr"] = ratio(latest["final_kills_bedwars"], latest["final_deaths_bedwars"])
+-    latest["kdr"] = ratio(latest["kills_bedwars"], latest["deaths_bedwars"])
+-    latest["bblr"] = ratio(latest["beds_broken_bedwars"], latest["beds_lost_bedwars"])
+-    latest["win_rate"] = (latest["wins_bedwars"] / latest["games_played_bedwars"].where(
+-        latest["games_played_bedwars"] != 0, 1)).round(3)
++    latest = add_ratios(df.groupby("uuid").tail(1).copy())
+ 
+     # Progress between consecutive snapshots (what changed since last time)
+     deltas = df.groupby("uuid")[COUNTERS].diff().add_suffix("_delta")
+@@ -178,10 +227,11 @@ def build_metrics(clean):
+         progress["wins_bedwars_delta"], progress["losses_bedwars_delta"]
+     )
+ 
+-    METRICS.mkdir(parents=True, exist_ok=True)
+-    latest.to_parquet(METRICS / "player_summary.parquet", index=False)
+-    progress.to_parquet(METRICS / "player_progress.parquet", index=False)
+-    print(f"metrics: {len(latest)} players, {len(progress)} progress rows")
++    if write and mode == "overall":
++        METRICS.mkdir(parents=True, exist_ok=True)
++        latest.to_parquet(METRICS / "player_summary.parquet", index=False)
++        progress.to_parquet(METRICS / "player_progress.parquet", index=False)
++        print(f"metrics: {len(latest)} players, {len(progress)} progress rows")
+     return latest, progress
+ 
+ 
+diff --git a/server.py b/server.py
+index 8084298..2cd383a 100644
+--- a/server.py
++++ b/server.py
+@@ -11,11 +11,12 @@ to Hypixel directly, so your API key is only used server side.
+ """
+ 
+ import json
+-import os
+ import re
++import time
+ from pathlib import Path
+ 
+ import pandas as pd
++import requests
+ from flask import Flask, jsonify, request, send_from_directory
+ 
+ import pipeline as p
+@@ -25,16 +26,21 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9_]{3,16}")
+ STATIC_DIR = Path(__file__).parent / "static"
+ 
+ SUMMARY_COLS = [
+-    "uuid", "username", "snapshot_ts", "bedwars_level", "games_played_bedwars",
+-    "win_rate", "wlr", "fkdr", "kdr", "bblr",
+-]
+-HISTORY_COLS = [
+-    "uuid", "username", "snapshot_ts", "bedwars_level", "games_played_bedwars", "fkdr", "wlr",
+-]
+-PROGRESS_COLS = [
+-    "uuid", "username", "snapshot_ts", "games_played_bedwars_delta", "wins_bedwars_delta",
+-    "final_kills_bedwars_delta", "final_deaths_bedwars_delta", "fkdr_period", "wlr_period",
++    "uuid", "username", "snapshot_ts", "bedwars_level",
++    "games_played_bedwars", "wins_bedwars", "losses_bedwars", "win_rate", "wlr",
++    "final_kills_bedwars", "final_deaths_bedwars", "fkdr",
++    "kills_bedwars", "deaths_bedwars", "kdr",
++    "beds_broken_bedwars", "beds_lost_bedwars", "bblr",
+ ]
++HISTORY_COLS = ["uuid", "username", "snapshot_ts", "bedwars_level"] + p.COUNTERS + ["fkdr", "wlr", "kdr", "bblr"]
++PROGRESS_COLS = (
++    ["uuid", "username", "snapshot_ts"]
++    + [f"{c}_delta" for c in p.COUNTERS]
++    + ["fkdr_period", "wlr_period"]
++)
++
++LIVE_TTL_SECONDS = 120
++_live_cache = {}  # lowercase username -> (fetched_at, uuid, raw_record). Memory only, cleared on restart.
+ 
+ app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
+ 
+@@ -63,66 +69,85 @@ def quality_payload(clean, bad):
+     }
+ 
+ 
+-def dashboard_payload():
+-    if not has_data():
+-        return {"empty": True}
++EMPTY_MODE = {"summary": [], "history": [], "progress": []}
+ 
+-    clean = p.build_clean()
+-    bad = read_quarantine()
+-    if clean.empty:
+-        return {
+-            "empty": False, "summary": [], "history": [], "progress": [],
+-            "quality": quality_payload(clean, bad),
+-        }
+ 
+-    latest, progress = p.build_metrics(clean)
++def mode_payload(clean, mode, write):
++    latest, progress = p.build_metrics(clean, write=write, mode=mode)
+ 
+-    history = clean.sort_values("snapshot_ts").copy()
+-    history["fkdr"] = p.ratio(history["final_kills_bedwars"], history["final_deaths_bedwars"])
+-    history["wlr"] = p.ratio(history["wins_bedwars"], history["losses_bedwars"])
++    history = p.add_ratios(p.mode_view(clean, mode).sort_values("snapshot_ts"))
+ 
+     return {
+-        "empty": False,
+         "summary": records(latest.sort_values("fkdr", ascending=False)[SUMMARY_COLS]),
+         "history": records(history[HISTORY_COLS]),
+         "progress": records(progress.sort_values("snapshot_ts", ascending=False)[PROGRESS_COLS]),
+-        "quality": quality_payload(clean, bad),
+     }
+ 
+ 
++def build_payload(clean, bad, write):
++    """Shared by the saved dashboard and live mode. write=False means no files are touched."""
++    if clean.empty:
++        modes = {m: EMPTY_MODE for m in p.MODES}
++    else:
++        modes = {m: mode_payload(clean, m, write) for m in p.MODES}
++    return {"empty": False, "modes": modes, "quality": quality_payload(clean, bad)}
++
++
++def dashboard_payload():
++    if not has_data():
++        return {"empty": True}
++    clean = p.build_clean()
++    return build_payload(clean, read_quarantine(), write=True)
++
++
++def fetch_live(name, api_key):
++    """Return (uuid, raw_record) for a player, reusing a recent fetch to protect the rate limit."""
++    cached = _live_cache.get(name.lower())
++    if cached and time.time() - cached[0] < LIVE_TTL_SECONDS:
++        return cached[1], cached[2]
++    uuid, record = p.fetch_snapshot(name, api_key)
++    _live_cache[name.lower()] = (time.time(), uuid, record)
++    return uuid, record
++
++
+ @app.get("/")
+ def index():
+     return send_from_directory(STATIC_DIR, "index.html")
+ 
+ 
+-@app.get("/api/config")
+-def config():
+-    return jsonify(server_has_key=bool(os.environ.get("HYPIXEL_API_KEY")))
+-
+-
+ @app.get("/api/dashboard")
+ def dashboard():
+     return jsonify(dashboard_payload())
+ 
+ 
+-@app.post("/api/fetch")
+-def fetch():
++def parse_request():
++    """Validate the request body. Returns (valid, invalid, api_key, error_response)."""
+     body = request.get_json(silent=True) or {}
+     raw_names = body.get("usernames", [])
+     names = [n.strip() for n in raw_names if isinstance(n, str) and n.strip()]
+ 
+-    api_key = request.headers.get("X-Hypixel-Key") or os.environ.get("HYPIXEL_API_KEY", "")
++    api_key = request.headers.get("X-Hypixel-Key", "")
++    api_key = api_key.strip().strip("\"'")  # tolerate stray spaces or quotes from copy and paste
+     if not api_key:
+-        return jsonify(error="No API key. Enter one in the form or set HYPIXEL_API_KEY."), 400
++        return None, None, None, (jsonify(error="Enter your Hypixel API key."), 400)
+     if not names:
+-        return jsonify(error="Enter at least one username."), 400
++        return None, None, None, (jsonify(error="Enter at least one username."), 400)
+     if len(names) > MAX_PLAYERS:
+-        return jsonify(error=f"Keep it to {MAX_PLAYERS} players per fetch to stay under the rate limit."), 400
++        return None, None, None, (jsonify(error=f"Keep it to {MAX_PLAYERS} players per fetch to stay under the rate limit."), 400)
+ 
+     valid = [n for n in names if USERNAME_RE.fullmatch(n)]
+     invalid = [n for n in names if not USERNAME_RE.fullmatch(n)]
+     if not valid:
+-        return jsonify(error="None of those look like valid Minecraft usernames (3 to 16 letters, numbers, or underscores)."), 400
++        return None, None, None, (jsonify(error="None of those look like valid Minecraft usernames (3 to 16 letters, numbers, or underscores)."), 400)
++    return valid, invalid, api_key, None
++
++
++@app.post("/api/fetch")
++def fetch():
++    """Fetch and SAVE snapshots to the data folder."""
++    valid, invalid, api_key, error = parse_request()
++    if error:
++        return error
+ 
+     result = p.ingest(valid, api_key)
+     skipped = [{"name": n, "reason": r} for n, r in result["skipped"]]
+@@ -130,5 +155,30 @@ def fetch():
+     return jsonify(saved=result["saved"], skipped=skipped)
+ 
+ 
++@app.post("/api/live")
++def live():
++    """Fetch and return a dashboard payload WITHOUT writing anything to disk."""
++    valid, invalid, api_key, error = parse_request()
++    if error:
++        return error
++
++    records_, fetched, skipped = [], [], []
++    for name in valid:
++        try:
++            _, record = fetch_live(name, api_key)
++        except (requests.RequestException, ValueError, RuntimeError) as exc:
++            skipped.append({"name": name, "reason": str(exc)})
++            continue
++        records_.append(record)
++        fetched.append(name)
++    skipped += [{"name": n, "reason": "not a valid Minecraft username"} for n in invalid]
++
++    if not records_:
++        return jsonify(error="Nothing could be fetched.", skipped=skipped), 502
++
++    clean, bad = p.clean_records(records_)
++    return jsonify(fetched=fetched, skipped=skipped, dashboard=build_payload(clean, bad, write=False))
++
++
+ if __name__ == "__main__":
+     app.run(host="127.0.0.1", port=8000, debug=False)
+diff --git a/static/app.js b/static/app.js
+index c7cbb23..1e394e7 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -6,10 +6,18 @@ const SUMMARY_COLUMNS = [
+   { key: "username", label: "Player", text: true },
+   { key: "bedwars_level", label: "Level", digits: 0 },
+   { key: "games_played_bedwars", label: "Games", digits: 0 },
++  { key: "wins_bedwars", label: "Wins", digits: 0 },
++  { key: "losses_bedwars", label: "Losses", digits: 0 },
+   { key: "win_rate", label: "Win rate", pct: true },
+   { key: "wlr", label: "WLR", digits: 2 },
++  { key: "final_kills_bedwars", label: "Final kills", digits: 0 },
++  { key: "final_deaths_bedwars", label: "Final deaths", digits: 0 },
+   { key: "fkdr", label: "FKDR", digits: 2 },
++  { key: "kills_bedwars", label: "Kills", digits: 0 },
++  { key: "deaths_bedwars", label: "Deaths", digits: 0 },
+   { key: "kdr", label: "KDR", digits: 2 },
++  { key: "beds_broken_bedwars", label: "Beds broken", digits: 0 },
++  { key: "beds_lost_bedwars", label: "Beds lost", digits: 0 },
+   { key: "bblr", label: "BBLR", digits: 2 },
+ ];
+ 
+@@ -18,8 +26,13 @@ const PROGRESS_COLUMNS = [
+   { key: "snapshot_ts", label: "Snapshot", date: true },
+   { key: "games_played_bedwars_delta", label: "Games", digits: 0, signed: true },
+   { key: "wins_bedwars_delta", label: "Wins", digits: 0, signed: true },
++  { key: "losses_bedwars_delta", label: "Losses", digits: 0, signed: true },
+   { key: "final_kills_bedwars_delta", label: "Final kills", digits: 0, signed: true },
+   { key: "final_deaths_bedwars_delta", label: "Final deaths", digits: 0, signed: true },
++  { key: "kills_bedwars_delta", label: "Kills", digits: 0, signed: true },
++  { key: "deaths_bedwars_delta", label: "Deaths", digits: 0, signed: true },
++  { key: "beds_broken_bedwars_delta", label: "Beds broken", digits: 0, signed: true },
++  { key: "beds_lost_bedwars_delta", label: "Beds lost", digits: 0, signed: true },
+   { key: "fkdr_period", label: "FKDR (period)", digits: 2 },
+   { key: "wlr_period", label: "WLR (period)", digits: 2 },
+ ];
+@@ -31,13 +44,17 @@ const QUALITY_COLUMNS = [
+ ];
+ 
+ const PALETTE = [
+-  "#4ade80", "#60a5fa", "#f472b6", "#fbbf24", "#a78bfa",
+-  "#f87171", "#2dd4bf", "#fb923c", "#94a3b8", "#e879f9",
++  "#f5f5f5", "#b0b0b0", "#8a8a8a", "#d6d6d6", "#707070",
++  "#c2c2c2", "#e8e8e8", "#7c7c7c", "#9e9e9e", "#5e5e5e",
+ ];
++// Line dashes keep players apart when several lines are similar shades of gray.
++const DASHES = [[], [6, 4], [2, 3], [10, 4, 2, 4], [], [6, 4], [2, 3], [10, 4, 2, 4], [], [6, 4]];
++
++const MODE_LABELS = { overall: "Overall", solo: "Solo", doubles: "Doubles", trios: "3s", fours: "4s" };
+ 
+ const state = {
+   data: null,
+-  config: { server_has_key: false },
++  mode: "overall",
+   sort: { key: "fkdr", dir: -1 },
+ };
+ 
+@@ -55,6 +72,11 @@ function el(tag, props = {}, ...children) {
+   return node;
+ }
+ 
++/** The summary, history and progress rows for the selected game mode. */
++function view() {
++  return state.data.modes[state.mode];
++}
++
+ function cssVar(name) {
+   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+ }
+@@ -145,7 +167,7 @@ function drawChart(canvasId, config) {
+ 
+ function sortedSummary() {
+   const { key, dir } = state.sort;
+-  return [...state.data.summary].sort((a, b) => {
++  return [...view().summary].sort((a, b) => {
+     const x = a[key];
+     const y = b[key];
+     if (x == null && y == null) return 0;
+@@ -165,6 +187,7 @@ function onSort(key) {
+ }
+ 
+ function renderLeaderboard() {
++  $("#mode-label").textContent = MODE_LABELS[state.mode];
+   renderTable($("#summary-table"), SUMMARY_COLUMNS, sortedSummary(), state.sort, onSort);
+   renderBarChart();
+ }
+@@ -172,7 +195,7 @@ function renderLeaderboard() {
+ function renderBarChart() {
+   const key = $("#bar-metric").value;
+   const col = SUMMARY_COLUMNS.find((c) => c.key === key);
+-  const rows = [...state.data.summary]
++  const rows = [...view().summary]
+     .filter((r) => r[key] != null)
+     .sort((a, b) => b[key] - a[key]);
+ 
+@@ -195,7 +218,7 @@ function renderBarChart() {
+ 
+ function renderHistory() {
+   const metric = $("#history-metric").value;
+-  const history = state.data.history;
++  const history = view().history;
+ 
+   const stamps = [...new Set(history.map((r) => r.snapshot_ts))].sort();
+   const byPlayer = new Map();
+@@ -213,6 +236,7 @@ function renderHistory() {
+     label: player.name,
+     data: stamps.map((s) => player.points.get(s) ?? null),
+     borderColor: PALETTE[i % PALETTE.length],
++    borderDash: DASHES[i % DASHES.length],
+     backgroundColor: PALETTE[i % PALETTE.length],
+     spanGaps: true,
+     tension: 0.25,
+@@ -224,7 +248,7 @@ function renderHistory() {
+     options: chartOptions(true),
+   });
+ 
+-  renderTable($("#progress-table"), PROGRESS_COLUMNS, state.data.progress, null, null);
++  renderTable($("#progress-table"), PROGRESS_COLUMNS, view().progress, null, null);
+ }
+ 
+ // ------------------------------------------------------------------ quality
+@@ -249,6 +273,14 @@ function render() {
+   renderQuality();
+ }
+ 
++function setMode(mode) {
++  state.mode = mode;
++  for (const btn of document.querySelectorAll(".mode-btn")) {
++    btn.setAttribute("aria-pressed", String(btn.dataset.mode === mode));
++  }
++  if (state.data && !state.data.empty) render();
++}
++
+ function showTab(name) {
+   for (const tab of document.querySelectorAll('[role="tab"]')) {
+     tab.setAttribute("aria-selected", String(tab.dataset.tab === name));
+@@ -273,29 +305,50 @@ async function loadDashboard() {
+ async function onFetch() {
+   const names = $("#usernames").value.split(/[\s,]+/).filter(Boolean);
+   const key = $("#api-key").value.trim();
++  const save = $("#save-toggle").checked;
+   const button = $("#fetch-btn");
+ 
++  if (!key) {
++    setStatus([{ kind: "error", text: "Enter your Hypixel API key first." }]);
++    $("#api-key").focus();
++    return;
++  }
++
+   button.disabled = true;
+   setStatus([{ kind: "info", text: "Fetching from Hypixel..." }]);
+ 
+   try {
+-    const headers = { "Content-Type": "application/json" };
+-    if (key) headers["X-Hypixel-Key"] = key;
++    const headers = { "Content-Type": "application/json", "X-Hypixel-Key": key };
+ 
+-    const res = await fetch("/api/fetch", {
++    const res = await fetch(save ? "/api/fetch" : "/api/live", {
+       method: "POST",
+       headers,
+       body: JSON.stringify({ usernames: names }),
+     });
+     const body = await res.json();
+-    if (!res.ok) throw new Error(body.error || `Request failed (${res.status}).`);
++    if (!res.ok) {
++      const detail = (body.skipped || []).map((s) => `${s.name}: ${s.reason}`).join("; ");
++      throw new Error([body.error || `Request failed (${res.status}).`, detail].filter(Boolean).join(" "));
++    }
+ 
+     const messages = [];
+-    if (body.saved.length) messages.push({ kind: "success", text: `Saved: ${body.saved.join(", ")}` });
++    if (save) {
++      if (body.saved.length) messages.push({ kind: "success", text: `Saved: ${body.saved.join(", ")}` });
++    } else {
++      messages.push({
++        kind: "info",
++        text: `Live view for ${body.fetched.join(", ")}. Nothing was saved, so a refresh clears this.`,
++      });
++    }
+     for (const s of body.skipped) messages.push({ kind: "warning", text: `Skipped ${s.name}: ${s.reason}` });
+     setStatus(messages);
+ 
+-    await loadDashboard();
++    if (save) {
++      await loadDashboard();
++    } else {
++      state.data = body.dashboard;   // in memory only
++      render();
++    }
+   } catch (err) {
+     setStatus([{ kind: "error", text: err.message }]);
+   } finally {
+@@ -303,12 +356,6 @@ async function onFetch() {
+   }
+ }
+ 
+-function updateKeyHint() {
+-  $("#api-key").placeholder = state.config.server_has_key
+-    ? "Optional: the server already has a key"
+-    : "Paste your Hypixel API key";
+-}
+-
+ async function init() {
+   if (!window.Chart) document.body.classList.add("no-charts");
+ 
+@@ -323,14 +370,9 @@ async function init() {
+   for (const tab of document.querySelectorAll('[role="tab"]')) {
+     tab.addEventListener("click", () => showTab(tab.dataset.tab));
+   }
+-
+-  try {
+-    const res = await fetch("/api/config");
+-    if (res.ok) state.config = await res.json();
+-  } catch {
+-    // Not fatal: the key field simply keeps its default hint.
++  for (const btn of document.querySelectorAll(".mode-btn")) {
++    btn.addEventListener("click", () => setMode(btn.dataset.mode));
+   }
+-  updateKeyHint();
+ 
+   try {
+     await loadDashboard();
+diff --git a/static/index.html b/static/index.html
+index 309eb56..c922abc 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -19,15 +19,19 @@
+     <div class="controls-grid">
+       <label class="field">
+         <span>Hypixel API key</span>
+-        <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Hypixel API key">
++        <input id="api-key" type="password" autocomplete="off" spellcheck="false" required placeholder="Paste your Hypixel API key">
+       </label>
+       <label class="field">
+         <span>Minecraft usernames (up to 10, separated by spaces, commas, or new lines)</span>
+-        <textarea id="usernames" rows="3" spellcheck="false" placeholder="YourName Friend1 Friend2"></textarea>
++        <textarea id="usernames" rows="1" spellcheck="false" placeholder="YourName Friend1 Friend2"></textarea>
+       </label>
+       <div class="actions">
+         <button id="fetch-btn" class="primary" type="button">Fetch latest stats</button>
+       </div>
++      <label class="check">
++        <input id="save-toggle" type="checkbox">
++        <span>Save snapshot to the data folder (needed for progress over time)</span>
++      </label>
+     </div>
+     <div id="status" class="status" role="status" aria-live="polite"></div>
+   </section>
+@@ -35,6 +39,14 @@
+   <p id="empty-state" class="card notice" hidden>No data yet. Enter a username above and press Fetch.</p>
+ 
+   <div id="dashboard" hidden>
++    <div class="mode-bar" role="group" aria-label="Game mode">
++      <span class="muted">Game mode</span>
++      <button class="mode-btn" data-mode="overall" aria-pressed="true" type="button">Overall</button>
++      <button class="mode-btn" data-mode="solo" aria-pressed="false" type="button">Solo</button>
++      <button class="mode-btn" data-mode="doubles" aria-pressed="false" type="button">Doubles</button>
++      <button class="mode-btn" data-mode="trios" aria-pressed="false" type="button">3s</button>
++      <button class="mode-btn" data-mode="fours" aria-pressed="false" type="button">4s</button>
++    </div>
+     <div class="tabs" role="tablist" aria-label="Dashboard sections">
+       <button role="tab" class="tab" data-tab="leaderboard" aria-selected="true" type="button">Leaderboard</button>
+       <button role="tab" class="tab" data-tab="history" aria-selected="false" type="button">History</button>
+@@ -42,7 +54,7 @@
+     </div>
+ 
+     <section id="panel-leaderboard" class="panel card">
+-      <h2>Lifetime stats (latest snapshot)</h2>
++      <h2>Lifetime stats (latest snapshot): <span id="mode-label">Overall</span></h2>
+       <div class="table-wrap"><table id="summary-table"></table></div>
+ 
+       <div class="row">
+@@ -66,8 +78,18 @@
+           <select id="history-metric">
+             <option value="fkdr">FKDR</option>
+             <option value="wlr">WLR</option>
++            <option value="kdr">KDR</option>
++            <option value="bblr">BBLR</option>
+             <option value="bedwars_level">Level</option>
+             <option value="games_played_bedwars">Games played</option>
++            <option value="wins_bedwars">Wins</option>
++            <option value="losses_bedwars">Losses</option>
++            <option value="final_kills_bedwars">Final kills</option>
++            <option value="final_deaths_bedwars">Final deaths</option>
++            <option value="kills_bedwars">Kills</option>
++            <option value="deaths_bedwars">Deaths</option>
++            <option value="beds_broken_bedwars">Beds broken</option>
++            <option value="beds_lost_bedwars">Beds lost</option>
+           </select>
+         </label>
+       </div>
+diff --git a/static/style.css b/static/style.css
+index 548682c..0cda051 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -1,14 +1,14 @@
+ :root {
+-  --bg: #0f1419;
+-  --surface: #171e26;
+-  --surface-2: #1f2933;
+-  --border: #2b3742;
+-  --text: #e6edf3;
+-  --muted: #8b98a5;
+-  --accent: #4ade80;
+-  --accent-ink: #062b14;
+-  --danger: #f87171;
+-  --warn: #fbbf24;
++  --bg: #0a0a0a;
++  --surface: #141414;
++  --surface-2: #1e1e1e;
++  --border: #2e2e2e;
++  --text: #f5f5f5;
++  --muted: #9a9a9a;
++  --accent: #f5f5f5;
++  --accent-ink: #0a0a0a;
++  --danger: #ffffff;
++  --warn: #b5b5b5;
+   --radius: 12px;
+ }
+ 
+@@ -19,7 +19,7 @@ html { color-scheme: dark; }
+ body {
+   margin: 0;
+   padding: 0 1rem 3rem;
+-  max-width: 1100px;
++  max-width: min(1700px, 96vw);
+   margin-inline: auto;
+   background: var(--bg);
+   color: var(--text);
+@@ -163,3 +163,15 @@ td.muted { text-align: center; }
+ }
+ 
+ [hidden] { display: none !important; }
++
++.check { grid-column: 1 / -1; display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; color: var(--muted); }
++.check input { width: auto; margin: 0; }
++
++/* ---------- game mode selector ---------- */
++.mode-bar { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
++.mode-btn {
++  background: var(--surface-2); color: var(--muted); border: 1px solid var(--border);
++  border-radius: 999px; padding: 0.3rem 0.9rem; font: inherit; cursor: pointer;
++}
++.mode-btn:hover { color: var(--text); }
++.mode-btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+diff --git a/test_pipeline.py b/test_pipeline.py
+index cc1568e..bc128ea 100644
+--- a/test_pipeline.py
++++ b/test_pipeline.py
+@@ -58,3 +58,18 @@ def test_validate_quarantines_bad_rows():
+ 
+     assert good["uuid"].tolist() == ["abc123"]
+     assert len(bad) == 3
++
++
++class FakeResponse:
++    def __init__(self, status):
++        self.status_code = status
++
++    def raise_for_status(self):
++        raise AssertionError("should have raised a friendly error first")
++
++
++def test_fetch_player_explains_a_403(monkeypatch):
++    import pytest
++    monkeypatch.setattr(p.requests, "get", lambda *a, **k: FakeResponse(403))
++    with pytest.raises(RuntimeError, match="API key"):
++        p.fetch_player("abc", "bad")
+diff --git a/test_server.py b/test_server.py
+index ab25a54..0dd34f0 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -49,9 +49,10 @@ def test_dashboard_with_history_and_quarantine(client):
+     data = client.get("/api/dashboard").get_json()
+ 
+     assert data["empty"] is False
+-    assert [r["username"] for r in data["summary"]] == ["PlayerA"]
+-    assert len(data["history"]) == 2
+-    assert len(data["progress"]) == 1
++    overall = data["modes"]["overall"]
++    assert [r["username"] for r in overall["summary"]] == ["PlayerA"]
++    assert len(overall["history"]) == 2
++    assert len(overall["progress"]) == 1
+     assert data["quality"]["passed"] == 2
+     assert data["quality"]["quarantined"] == 1
+     assert data["quality"]["players"] == 1
+@@ -61,7 +62,7 @@ def test_dashboard_with_history_and_quarantine(client):
+ def test_dashboard_when_every_row_fails_validation(client):
+     write_snapshot("bad", "Broken", "20260903T120000Z", kills_bedwars=-1)
+     data = client.get("/api/dashboard").get_json()
+-    assert data["summary"] == []
++    assert data["modes"]["overall"]["summary"] == []
+     assert data["quality"]["quarantined"] == 1
+ 
+ 
+@@ -109,16 +110,64 @@ def test_fetch_passes_valid_names_to_ingest_and_reports_skips(client, monkeypatc
+     assert "Ghost" in reasons and reasons["bad name!"] == "not a valid Minecraft username"
+ 
+ 
+-def test_fetch_falls_back_to_server_environment_key(client, monkeypatch):
++def test_server_environment_key_is_ignored(client, monkeypatch):
+     monkeypatch.setenv("HYPIXEL_API_KEY", "from_env")
+-    seen = {}
+-    monkeypatch.setattr(p, "ingest", lambda names, key: seen.update(key=key) or {"saved": names, "skipped": []})
+     res = client.post("/api/fetch", json={"usernames": ["SomeName"]})
++    assert res.status_code == 400
++    assert "API key" in res.get_json()["error"]
++
++
++def test_live_returns_dashboard_and_writes_nothing(client, monkeypatch):
++    server._live_cache.clear()
++    monkeypatch.setattr(p, "fetch_snapshot", lambda name, key: ("u1", make_record(
++        uuid="u1", wins_bedwars=5, losses_bedwars=5, games_played_bedwars=10,
++        final_kills_bedwars=20, final_deaths_bedwars=10)))
++    res = client.post("/api/live", json={"usernames": ["GoodName"]}, headers={"X-Hypixel-Key": "k"})
++    body = res.get_json()
++
+     assert res.status_code == 200
+-    assert seen["key"] == "from_env"
++    assert body["fetched"] == ["GoodName"]
++    assert body["dashboard"]["modes"]["overall"]["summary"][0]["fkdr"] == 2.0
++    assert not p.DATA.joinpath("raw").exists()
++    assert not p.CLEAN.exists() and not p.METRICS.exists()
++
++
++def test_live_caches_repeat_lookups(client, monkeypatch):
++    server._live_cache.clear()
++    calls = []
++    monkeypatch.setattr(p, "fetch_snapshot", lambda name, key: calls.append(name) or ("u1", make_record(uuid="u1")))
++    for _ in range(2):
++        client.post("/api/live", json={"usernames": ["GoodName"]}, headers={"X-Hypixel-Key": "k"})
++    assert calls == ["GoodName"]
++
++
++def test_live_reports_error_when_nothing_fetched(client, monkeypatch):
++    server._live_cache.clear()
++    def boom(name, key):
++        raise ValueError("no such Minecraft account: Ghost")
++    monkeypatch.setattr(p, "fetch_snapshot", boom)
++    res = client.post("/api/live", json={"usernames": ["Ghost"]}, headers={"X-Hypixel-Key": "k"})
++    assert res.status_code == 502
++    assert res.get_json()["skipped"][0]["name"] == "Ghost"
++
++
++def test_dashboard_splits_stats_by_game_mode(client):
++    write_snapshot(
++        "aaa", "PlayerA", "20260901T120000Z",
++        games_played_bedwars=30, wins_bedwars=20, final_kills_bedwars=50,
++        eight_one_games_played_bedwars=10, eight_one_wins_bedwars=4, eight_one_final_kills_bedwars=12,
++        eight_two_games_played_bedwars=20, eight_two_wins_bedwars=16, eight_two_final_kills_bedwars=38,
++    )
++    modes = client.get("/api/dashboard").get_json()["modes"]
++
++    assert set(modes) == {"overall", "solo", "doubles", "trios", "fours"}
++    assert modes["overall"]["summary"][0]["final_kills_bedwars"] == 50
++    assert modes["solo"]["summary"][0]["final_kills_bedwars"] == 12
++    assert modes["doubles"]["summary"][0]["wins_bedwars"] == 16
++    assert modes["trios"]["summary"][0]["games_played_bedwars"] == 0
++    assert "beds_broken_bedwars" in modes["solo"]["summary"][0]
+ 
+ 
+-def test_config_reports_whether_server_has_key(client, monkeypatch):
+-    assert client.get("/api/config").get_json() == {"server_has_key": False}
+-    monkeypatch.setenv("HYPIXEL_API_KEY", "x")
+-    assert client.get("/api/config").get_json() == {"server_has_key": True}
++def test_mode_with_more_wins_than_games_is_quarantined(client):
++    write_snapshot("aaa", "PlayerA", "20260901T120000Z", eight_one_wins_bedwars=5, eight_one_games_played_bedwars=2)
++    assert client.get("/api/dashboard").get_json()["quality"]["quarantined"] == 1
