@@ -19,15 +19,19 @@
     <div class="controls-grid">
       <label class="field">
         <span>Hypixel API key</span>
-        <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Hypixel API key">
+        <input id="api-key" type="password" autocomplete="off" spellcheck="false" required placeholder="Paste your Hypixel API key">
       </label>
       <label class="field">
         <span>Minecraft usernames (up to 10, separated by spaces, commas, or new lines)</span>
-        <textarea id="usernames" rows="3" spellcheck="false" placeholder="YourName Friend1 Friend2"></textarea>
+        <textarea id="usernames" rows="1" spellcheck="false" placeholder="YourName Friend1 Friend2"></textarea>
       </label>
       <div class="actions">
         <button id="fetch-btn" class="primary" type="button">Fetch latest stats</button>
       </div>
+      <label class="check">
+        <input id="save-toggle" type="checkbox">
+        <span>Save snapshot to the data folder (needed for progress over time)</span>
+      </label>
     </div>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </section>
@@ -35,6 +39,14 @@
   <p id="empty-state" class="card notice" hidden>No data yet. Enter a username above and press Fetch.</p>
 
   <div id="dashboard" hidden>
+    <div class="mode-bar" role="group" aria-label="Game mode">
+      <span class="muted">Game mode</span>
+      <button class="mode-btn" data-mode="overall" aria-pressed="true" type="button">Overall</button>
+      <button class="mode-btn" data-mode="solo" aria-pressed="false" type="button">Solo</button>
+      <button class="mode-btn" data-mode="doubles" aria-pressed="false" type="button">Doubles</button>
+      <button class="mode-btn" data-mode="trios" aria-pressed="false" type="button">3s</button>
+      <button class="mode-btn" data-mode="fours" aria-pressed="false" type="button">4s</button>
+    </div>
     <div class="tabs" role="tablist" aria-label="Dashboard sections">
       <button role="tab" class="tab" data-tab="leaderboard" aria-selected="true" type="button">Leaderboard</button>
       <button role="tab" class="tab" data-tab="history" aria-selected="false" type="button">History</button>
@@ -42,7 +54,7 @@
     </div>
 
     <section id="panel-leaderboard" class="panel card">
-      <h2>Lifetime stats (latest snapshot)</h2>
+      <h2>Lifetime stats (latest snapshot): <span id="mode-label">Overall</span></h2>
       <div class="table-wrap"><table id="summary-table"></table></div>
 
       <div class="row">
@@ -66,8 +78,18 @@
           <select id="history-metric">
             <option value="fkdr">FKDR</option>
             <option value="wlr">WLR</option>
+            <option value="kdr">KDR</option>
+            <option value="bblr">BBLR</option>
             <option value="bedwars_level">Level</option>
             <option value="games_played_bedwars">Games played</option>
+            <option value="wins_bedwars">Wins</option>
+            <option value="losses_bedwars">Losses</option>
+            <option value="final_kills_bedwars">Final kills</option>
+            <option value="final_deaths_bedwars">Final deaths</option>
+            <option value="kills_bedwars">Kills</option>
+            <option value="deaths_bedwars">Deaths</option>
+            <option value="beds_broken_bedwars">Beds broken</option>
+            <option value="beds_lost_bedwars">Beds lost</option>
           </select>
         </label>
       </div>

@@ -6,10 +6,18 @@ const SUMMARY_COLUMNS = [
   { key: "username", label: "Player", text: true },
   { key: "bedwars_level", label: "Level", digits: 0 },
   { key: "games_played_bedwars", label: "Games", digits: 0 },
+  { key: "wins_bedwars", label: "Wins", digits: 0 },
+  { key: "losses_bedwars", label: "Losses", digits: 0 },
   { key: "win_rate", label: "Win rate", pct: true },
   { key: "wlr", label: "WLR", digits: 2 },
+  { key: "final_kills_bedwars", label: "Final kills", digits: 0 },
+  { key: "final_deaths_bedwars", label: "Final deaths", digits: 0 },
   { key: "fkdr", label: "FKDR", digits: 2 },
+  { key: "kills_bedwars", label: "Kills", digits: 0 },
+  { key: "deaths_bedwars", label: "Deaths", digits: 0 },
   { key: "kdr", label: "KDR", digits: 2 },
+  { key: "beds_broken_bedwars", label: "Beds broken", digits: 0 },
+  { key: "beds_lost_bedwars", label: "Beds lost", digits: 0 },
   { key: "bblr", label: "BBLR", digits: 2 },
 ];
 
@@ -18,8 +26,13 @@ const PROGRESS_COLUMNS = [
   { key: "snapshot_ts", label: "Snapshot", date: true },
   { key: "games_played_bedwars_delta", label: "Games", digits: 0, signed: true },
   { key: "wins_bedwars_delta", label: "Wins", digits: 0, signed: true },
+  { key: "losses_bedwars_delta", label: "Losses", digits: 0, signed: true },
   { key: "final_kills_bedwars_delta", label: "Final kills", digits: 0, signed: true },
   { key: "final_deaths_bedwars_delta", label: "Final deaths", digits: 0, signed: true },
+  { key: "kills_bedwars_delta", label: "Kills", digits: 0, signed: true },
+  { key: "deaths_bedwars_delta", label: "Deaths", digits: 0, signed: true },
+  { key: "beds_broken_bedwars_delta", label: "Beds broken", digits: 0, signed: true },
+  { key: "beds_lost_bedwars_delta", label: "Beds lost", digits: 0, signed: true },
   { key: "fkdr_period", label: "FKDR (period)", digits: 2 },
   { key: "wlr_period", label: "WLR (period)", digits: 2 },
 ];
@@ -31,13 +44,17 @@ const QUALITY_COLUMNS = [
 ];
 
 const PALETTE = [
-  "#4ade80", "#60a5fa", "#f472b6", "#fbbf24", "#a78bfa",
-  "#f87171", "#2dd4bf", "#fb923c", "#94a3b8", "#e879f9",
+  "#f5f5f5", "#b0b0b0", "#8a8a8a", "#d6d6d6", "#707070",
+  "#c2c2c2", "#e8e8e8", "#7c7c7c", "#9e9e9e", "#5e5e5e",
 ];
+// Line dashes keep players apart when several lines are similar shades of gray.
+const DASHES = [[], [6, 4], [2, 3], [10, 4, 2, 4], [], [6, 4], [2, 3], [10, 4, 2, 4], [], [6, 4]];
+
+const MODE_LABELS = { overall: "Overall", solo: "Solo", doubles: "Doubles", trios: "3s", fours: "4s" };
 
 const state = {
   data: null,
-  config: { server_has_key: false },
+  mode: "overall",
   sort: { key: "fkdr", dir: -1 },
 };
 
@@ -53,6 +70,11 @@ function el(tag, props = {}, ...children) {
   Object.assign(node, props);
   node.append(...children);
   return node;
+}
+
+/** The summary, history and progress rows for the selected game mode. */
+function view() {
+  return state.data.modes[state.mode];
 }
 
 function cssVar(name) {
@@ -145,7 +167,7 @@ function drawChart(canvasId, config) {
 
 function sortedSummary() {
   const { key, dir } = state.sort;
-  return [...state.data.summary].sort((a, b) => {
+  return [...view().summary].sort((a, b) => {
     const x = a[key];
     const y = b[key];
     if (x == null && y == null) return 0;
@@ -165,6 +187,7 @@ function onSort(key) {
 }
 
 function renderLeaderboard() {
+  $("#mode-label").textContent = MODE_LABELS[state.mode];
   renderTable($("#summary-table"), SUMMARY_COLUMNS, sortedSummary(), state.sort, onSort);
   renderBarChart();
 }
@@ -172,7 +195,7 @@ function renderLeaderboard() {
 function renderBarChart() {
   const key = $("#bar-metric").value;
   const col = SUMMARY_COLUMNS.find((c) => c.key === key);
-  const rows = [...state.data.summary]
+  const rows = [...view().summary]
     .filter((r) => r[key] != null)
     .sort((a, b) => b[key] - a[key]);
 
@@ -195,7 +218,7 @@ function renderBarChart() {
 
 function renderHistory() {
   const metric = $("#history-metric").value;
-  const history = state.data.history;
+  const history = view().history;
 
   const stamps = [...new Set(history.map((r) => r.snapshot_ts))].sort();
   const byPlayer = new Map();
@@ -213,6 +236,7 @@ function renderHistory() {
     label: player.name,
     data: stamps.map((s) => player.points.get(s) ?? null),
     borderColor: PALETTE[i % PALETTE.length],
+    borderDash: DASHES[i % DASHES.length],
     backgroundColor: PALETTE[i % PALETTE.length],
     spanGaps: true,
     tension: 0.25,
@@ -224,7 +248,7 @@ function renderHistory() {
     options: chartOptions(true),
   });
 
-  renderTable($("#progress-table"), PROGRESS_COLUMNS, state.data.progress, null, null);
+  renderTable($("#progress-table"), PROGRESS_COLUMNS, view().progress, null, null);
 }
 
 // ------------------------------------------------------------------ quality
@@ -247,6 +271,14 @@ function render() {
   renderLeaderboard();
   renderHistory();
   renderQuality();
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  for (const btn of document.querySelectorAll(".mode-btn")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.mode === mode));
+  }
+  if (state.data && !state.data.empty) render();
 }
 
 function showTab(name) {
@@ -273,40 +305,55 @@ async function loadDashboard() {
 async function onFetch() {
   const names = $("#usernames").value.split(/[\s,]+/).filter(Boolean);
   const key = $("#api-key").value.trim();
+  const save = $("#save-toggle").checked;
   const button = $("#fetch-btn");
+
+  if (!key) {
+    setStatus([{ kind: "error", text: "Enter your Hypixel API key first." }]);
+    $("#api-key").focus();
+    return;
+  }
 
   button.disabled = true;
   setStatus([{ kind: "info", text: "Fetching from Hypixel..." }]);
 
   try {
-    const headers = { "Content-Type": "application/json" };
-    if (key) headers["X-Hypixel-Key"] = key;
+    const headers = { "Content-Type": "application/json", "X-Hypixel-Key": key };
 
-    const res = await fetch("/api/fetch", {
+    const res = await fetch(save ? "/api/fetch" : "/api/live", {
       method: "POST",
       headers,
       body: JSON.stringify({ usernames: names }),
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || `Request failed (${res.status}).`);
+    if (!res.ok) {
+      const detail = (body.skipped || []).map((s) => `${s.name}: ${s.reason}`).join("; ");
+      throw new Error([body.error || `Request failed (${res.status}).`, detail].filter(Boolean).join(" "));
+    }
 
     const messages = [];
-    if (body.saved.length) messages.push({ kind: "success", text: `Saved: ${body.saved.join(", ")}` });
+    if (save) {
+      if (body.saved.length) messages.push({ kind: "success", text: `Saved: ${body.saved.join(", ")}` });
+    } else {
+      messages.push({
+        kind: "info",
+        text: `Live view for ${body.fetched.join(", ")}. Nothing was saved, so a refresh clears this.`,
+      });
+    }
     for (const s of body.skipped) messages.push({ kind: "warning", text: `Skipped ${s.name}: ${s.reason}` });
     setStatus(messages);
 
-    await loadDashboard();
+    if (save) {
+      await loadDashboard();
+    } else {
+      state.data = body.dashboard;   // in memory only
+      render();
+    }
   } catch (err) {
     setStatus([{ kind: "error", text: err.message }]);
   } finally {
     button.disabled = false;
   }
-}
-
-function updateKeyHint() {
-  $("#api-key").placeholder = state.config.server_has_key
-    ? "Optional: the server already has a key"
-    : "Paste your Hypixel API key";
 }
 
 async function init() {
@@ -323,14 +370,9 @@ async function init() {
   for (const tab of document.querySelectorAll('[role="tab"]')) {
     tab.addEventListener("click", () => showTab(tab.dataset.tab));
   }
-
-  try {
-    const res = await fetch("/api/config");
-    if (res.ok) state.config = await res.json();
-  } catch {
-    // Not fatal: the key field simply keeps its default hint.
+  for (const btn of document.querySelectorAll(".mode-btn")) {
+    btn.addEventListener("click", () => setMode(btn.dataset.mode));
   }
-  updateKeyHint();
 
   try {
     await loadDashboard();
